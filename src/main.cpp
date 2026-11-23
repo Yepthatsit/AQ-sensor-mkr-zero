@@ -1,12 +1,11 @@
 #include <Arduino.h>
+#include <Wire.h>
 #include <TinyGPSPlus.h>
-#include <DHT.h>
 #include <SensirionI2CSen5x.h>
 
 static const uint32_t GPSBaud = 9600;
 
 TinyGPSPlus gps;
-DHT dht(4, DHT11); // pin 4, sensor DHT11
 SensirionI2CSen5x sen55; // instancja czujnika SEN5X
 
 // definiujemy strukturę na dane odczytane z gps
@@ -19,7 +18,6 @@ struct GPSData {
   double speedKmph = 0.0;
   uint32_t satellites = 0;
   uint32_t lastUpdateMs = 0;
-
   bool timeValid = false;
   uint16_t year = 0;
   uint8_t month = 0;
@@ -29,10 +27,6 @@ struct GPSData {
   uint8_t second = 0;
 };
 
-struct DHTData {
-  float temperature = 0.0;
-  float humidity = 0.0;
-};
 
 struct SEN55Data {
   bool connected = false;
@@ -48,7 +42,6 @@ struct SEN55Data {
 };
 GPSData gpsData; // globalna zmienna do przechowywania danych GPS
 
-DHTData dhtData; // globalna zmienna do przechowywania danych DHT
 
 SEN55Data sen55Data; // globalna zmienna do przechowywania danych SEN55
 
@@ -56,22 +49,41 @@ SEN55Data sen55Data; // globalna zmienna do przechowywania danych SEN55
 // Definiujemy funkcję do odczytu danych z GPS, logiga na dole pliku
 bool readGPS(GPSData &data);
 
-// Definiujemy funkcję do odczytu danych z DHT, logiga na dole pliku
-bool readDHT(DHTData &data); 
-
+// Definiujemy funkcję do odczytu danych z SEN55, logiga na dole pliku
+bool readSEN55(SEN55Data &data);
 
 void setup() {
   // put your setup code here, to run once:
   Serial.begin(9600); // Inicjalizacja portu szeregowego dla komunikacji z komputerem
   Serial1.begin(GPSBaud); // Inicjalizacja portu szeregowego dla komunikacji z modułem GPS
+  Wire.begin(); // Inicjalizacja magistrali I2C
+  sen55.begin(Wire); // Inicjalizacja czujnika SEN55
+  char errorMessage[256];
+  uint16_t error = sen55.deviceReset();
+  if (error) {
+    errorToString(error, errorMessage, sizeof(errorMessage));
+    Serial.print("SEN55 deviceReset failed: ");
+    Serial.println(errorMessage);
+    return;
+  }
 
-  dht.begin(); // Inicjalizacja czujnika DHT
+  error = sen55.startMeasurement();
+  if (error) {
+    errorToString(error, errorMessage, sizeof(errorMessage));
+    Serial.print("SEN55 startMeasurement failed: ");
+    Serial.println(errorMessage);
+    return;
+  }
+
+  sen55Data.connected = true;
+  Serial.println("SEN55 initialized and fan started.");
 }
 
 void loop() {
   static uint32_t lastPrintMs = 0;
   if (millis() - lastPrintMs >= 3000) {
     lastPrintMs = millis();
+    readSEN55(sen55Data);
     if (readGPS(gpsData)) {
       Serial.print("Connected: ");
       Serial.print(gpsData.connected);
@@ -94,15 +106,17 @@ void loop() {
       Serial.print(", DateTime: ");
       Serial.println(gpsData.timeValid ? buf : "n/a");
     }
-    if (readDHT(dhtData)) {
-      Serial.print("Temperature: ");
-      Serial.print(dhtData.temperature);
-      Serial.print(" °C, Humidity: ");
-      Serial.print(dhtData.humidity);
-      Serial.println(" %");
-    }
-    else {
-      Serial.println("Failed to read from DHT sensor!");
+    if (sen55Data.valid) {
+      Serial.print("SEN55 -> PM1.0: "); Serial.print(sen55Data.pm1p0, 1);
+      Serial.print(" | PM2.5: "); Serial.print(sen55Data.pm2p5, 1);
+      Serial.print(" | PM4.0: "); Serial.print(sen55Data.pm4p0, 1);
+      Serial.print(" | PM10: "); Serial.print(sen55Data.pm10p0, 1);
+      Serial.print(" ug/m3 | Temp: "); Serial.print(sen55Data.temperature, 2);
+      Serial.print(" C | RH: "); Serial.print(sen55Data.humidity, 1);
+      Serial.print(" % | VOC: "); Serial.print(sen55Data.vocIndex, 0);
+      Serial.print(" | NOx: "); Serial.println(sen55Data.noxIndex, 0);
+    } else {
+      Serial.println("SEN55 -> Oczekiwanie na dane lub blad odczytu...");
     }
   }
 }
@@ -153,13 +167,23 @@ bool readGPS(GPSData &data) {
   return newSentence;
 }
 
-bool readDHT(DHTData &data) {
-  data.temperature = dht.readTemperature();
-  data.humidity = dht.readHumidity();
 
-  // Check if any reads failed and exit early (to try again).
-  if (isnan(data.temperature) || isnan(data.humidity)) {
+bool readSEN55(SEN55Data &data) {
+  if (!data.connected) {
+    data.valid = false;
     return false;
   }
-  return true;
+
+  uint16_t error = sen55.readMeasuredValues(
+      data.pm1p0, data.pm2p5, data.pm4p0, data.pm10p0,
+      data.humidity, data.temperature, data.vocIndex, data.noxIndex);
+
+  if (error) {
+    data.valid = false;
+    return false;
+  }
+
+  // Uwaga: Na starcie (pierwsze ~1-10 s) VOC i NOx są niewiarygodne zanim algorytm się ustabilizuje
+  data.valid = !isnan(data.temperature) && !isnan(data.pm2p5);
+  return data.valid;
 }
